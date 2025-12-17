@@ -1,268 +1,277 @@
 #include <WiFiS3.h>
+#include <ArduinoHttpClient.h>
 #include <Servo.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
 
-const int STOP_US = 1515;  
-int US_CW   = 1240;        // <<< HORARIO (abrir).
-int US_CCW  = 1780;        // <<< ANTIHORARIO (cerrar)
+/* =========================
+   WIFI
+   ========================= */
+const char* ssid = "hotspot";
+const char* password = "1234567a";
 
-/* ajuste de ° */
-unsigned long T_90_MS = 900;  
+/* =========================
+   FIREBASE
+   ========================= */
+const char* firebaseHost = "appgasiot-default-rtdb.firebaseio.com";
+const char* firebaseAuth = "4sj2ui1yE544LRJCOeWzK0qZogYL1jN8GRWEArFF";
 
-const bool GAS_DO_ACTIVO_LOW = true;
+WiFiSSLClient wifi;
+HttpClient client(wifi, firebaseHost, 443);
 
-/* Filtros anti-ruido y tiempos */
-const unsigned long T_CONFIRM_GAS_MS   = 600;   // gas sostenido para confirmar
-const unsigned long T_CONFIRM_CLEAR_MS = 900;   // limpio sostenido para confirmar
-const unsigned long HOLD_CERRADO_MS    = 5000;  // 5 s quieto tras cerrar
-const unsigned long SETTLE_MS          = 100;   // asentamiento corto tras stop (extra)
+/* =========================
+   NTP
+   ========================= */
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
 
-/* Pines */
-const int PIN_SERVO  = 9;   // señal servo
-const int PIN_GAS_DO = 2;   // DO MQ-6
+/* =========================
+   HARDWARE
+   ========================= */
+#define GAS_PIN A0
+#define SERVO_PIN 9
 
-/* Wi-Fi AP (control desde el móvil) */
-const char* AP_SSID = "MQ6-Servo";
-const char* AP_PASS = "12345678";
-WiFiServer server(80);
+Servo compuerta;
 
-/* Estado lógico */
-Servo s;
-bool compuertaCerrada = false;  // false=abierta; true=cerrada
-bool paused = false;
+/* =========================
+   ESTADO
+   ========================= */
+String modo = "manual";        // manual | automatico
+String estado = "cerrado";     // abierto | cerrado
+String ultimoEstadoDB = "";
 
-enum Estado { ABIERTO, CERRADO_HOLD, PROBANDO_ABIERTO };
-Estado estado = ABIERTO;
+int rangoMin = 200;
+int rangoMax = 800;
 
-unsigned long tGasStart=0, tOkStart=0;
-unsigned long tEstadoDesde=0, tProbeDesde=0;
+int eventoMin = 200;
+int eventoMax = 400;
 
-/* ================== HELPERS SERVO ================== */
-inline void servoStop() { s.writeMicroseconds(STOP_US); delay(SETTLE_MS); }
+unsigned long lastSend = 0;
+unsigned long lastEvent = 0;
 
-/* Tope a los 90*/
-void pulseLimited(int us_cmd, unsigned long ms) {
-  if (ms > T_90_MS) ms = T_90_MS;  // tope de 90°
-  if (ms == 0) { servoStop(); return; }
-  s.writeMicroseconds(us_cmd);
-  delay(ms);
-  servoStop();
-}
+// intervalo de envío
+const unsigned long INTERVALO_ENVIO = 30000; // 30s
 
-/* Movimientos a 90° por tiempo*/
-void abrir_CW_90()  { pulseLimited(US_CW,  T_90_MS); compuertaCerrada = false; }
-void cerrar_CCW_90(){ pulseLimited(US_CCW, T_90_MS); compuertaCerrada = true;  }
-
-/* ================== MQ-6 con confirmación ================== */
-bool leerGasConfirmado() {
-  int doRaw = digitalRead(PIN_GAS_DO);
-  bool gasRaw = GAS_DO_ACTIVO_LOW ? (doRaw == LOW) : (doRaw == HIGH);
-  unsigned long now = millis();
-
-  if (gasRaw) { if (!tGasStart) tGasStart = now; tOkStart = 0; }
-  else        { if (!tOkStart) tOkStart = now; tGasStart = 0; }
-
-  bool gasOK = (tGasStart && (now - tGasStart >= T_CONFIRM_GAS_MS));
-  bool okOK  = (tOkStart  && (now - tOkStart  >= T_CONFIRM_CLEAR_MS));
-
-  if (gasOK) return true;
-  if (okOK)  return false;
-  return gasRaw; 
-}
-
-/* ================== HTTP  ================== */
-String readLine(WiFiClient& c) {
-  String line=""; 
-  while (c.connected()) {
-    int ch=c.read();
-    if (ch<0){delay(1);continue;}
-    if (ch=='\r') continue;
-    if (ch=='\n') break;
-    line+=(char)ch;
-  }
-  return line;
-}
-
-void sendText(WiFiClient& c, const String& body) {
-  c.println("HTTP/1.1 200 OK");
-  c.println("Content-Type: text/plain; charset=utf-8");
-  c.println("Connection: close");
-  c.print("Content-Length: "); c.println(body.length());
-  c.println();
-  c.print(body);
-}
-
-void sendHTML(WiFiClient& c) {
-  String html =
-"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Servo 90° Tiempo</title>"
-"<style>body{font-family:system-ui;margin:16px}button{padding:12px 16px;border-radius:10px;border:0;margin:6px;font-weight:600}"
-".open{background:#10b981;color:#fff}.close{background:#ef4444;color:#fff}.pause{background:#6b7280;color:#fff}"
-".pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#eee;margin-left:6px}"
-"input[type=number]{width:100px;padding:6px;margin-left:8px}"
-"</style></head><body>"
-"<h2>Bisagra por tiempo (≤90°)</h2>"
-"<p>Estado: <span id='st' class='pill'>...</span> · <span id='pa' class='pill'>...</span></p>"
-"<button class='open'  onclick='go(1)'>Abrir 90° (CW) [1]</button>"
-"<button class='close' onclick='go(2)'>Cerrar 90° (CCW) [2]</button>"
-"<button class='pause' onclick='go(0)'>Pausa/Resume [0]</button>"
-"<p>Tope 90° (ms): <input id='t' type='number' min='100' max='4000' step='10'><button onclick='setT()'>Set</button></p>"
-"<script>"
-"async function go(b){await fetch('/cmd?b='+b); setTimeout(refresh,200);} "
-"async function refresh(){let r=await fetch('/status'); let j=await r.json(); "
-"document.getElementById('st').textContent=j.closed?'CERRADO':'ABIERTO'; "
-"document.getElementById('pa').textContent=j.paused?'PAUSA':'AUTO'; "
-"document.getElementById('t').value=j.t90; } "
-"async function setT(){let v=+document.getElementById('t').value; await fetch('/set?t='+v); setTimeout(refresh,300);} "
-"refresh(); setInterval(refresh,1500);"
-"</script></body></html>";
-  c.println("HTTP/1.1 200 OK");
-  c.println("Content-Type: text/html; charset=utf-8");
-  c.println("Connection: close");
-  c.print("Content-Length: "); c.println(html.length());
-  c.println();
-  c.print(html);
-}
-
-void handleClient(WiFiClient& client) {
-  String reqLine = readLine(client);
-  if (!reqLine.length()) return;
-  while (true) { String h=readLine(client); if (!h.length()) break; }
-
-  bool isGET = reqLine.startsWith("GET ");
-  int sp1=reqLine.indexOf(' '), sp2=reqLine.indexOf(' ', sp1+1);
-  String path=reqLine.substring(sp1+1, sp2);
-
-  if (isGET && (path=="/" || path.startsWith("/index.html"))) { sendHTML(client); return; }
-
-  if (isGET && path.startsWith("/status")) {
-    String body = String("{\"closed\":") + (compuertaCerrada ? "true" : "false")
-                + ",\"paused\":" + (paused ? "true" : "false")
-                + ",\"t90\":" + String(T_90_MS)
-                + "}";
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: application/json; charset=utf-8");
-    client.println("Cache-Control: no-store");
-    client.println("Connection: close");
-    client.print("Content-Length: ");
-    client.println(body.length());
-    client.println();
-    client.print(body);
-    return;
-  }
-
-  if (isGET && path.startsWith("/set")) {
-    // /limites de seguridad
-    int q=path.indexOf('?'), tIdx=path.indexOf("t=", q);
-    if (tIdx>0) {
-      int amp=path.indexOf('&', tIdx);
-      String sVal=path.substring(tIdx+2, amp>0?amp:path.length());
-      long v = sVal.toInt();
-      if (v < 100) v = 100;
-      if (v > 4000) v = 4000;
-      T_90_MS = (unsigned long)v;
-      sendText(client, "OK T_90_MS="+String(T_90_MS));
-      return;
-    }
-    sendText(client, "Uso: /set?t=900");
-    return;
-  }
-
-  if (isGET && path.startsWith("/cmd")) {
-    // /cmd?b=0 → pausa/resume ; 1 → abrir 90° CW ; 2 → cerrar 90° CCW
-    int q=path.indexOf('?'); int bIdx=path.indexOf("b=", q);
-    int val=-1;
-    if (bIdx>0){ int amp=path.indexOf('&', bIdx);
-      String sVal=path.substring(bIdx+2, amp>0?amp:path.length());
-      val=sVal.toInt();
-    }
-
-    if (val==0) { paused = !paused; sendText(client, paused? "PAUSA ON":"PAUSA OFF"); return; }
-    if (paused) { sendText(client, "En PAUSA: ignoro orden."); return; }
-
-    if (val==1) { abrir_CW_90();  sendText(client, "OK ABRIR 90° (CW)");  return; }
-    if (val==2) { cerrar_CCW_90(); sendText(client, "OK CERRAR 90° (CCW)"); return; }
-
-    sendText(client, "Uso: /cmd?b=0 pausa | /cmd?b=1 abrir | /cmd?b=2 cerrar");
-    return;
-  }
-
-  client.println("HTTP/1.1 404 Not Found");
-  client.println("Connection: close");
-  client.println();
-}
-
-/* ================== SETUP/LOOP ================== */
+/* =========================
+   SETUP
+   ========================= */
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_GAS_DO, INPUT);
 
-  s.attach(PIN_SERVO, 500, 2500);
-  servoStop(); // quieto al inicio
-  compuertaCerrada = false;  //arranque “abierto”
-  estado = ABIERTO;
-  tEstadoDesde = millis();
+  compuerta.attach(SERVO_PIN);
+  detenerCompuerta();
 
-  int st = WiFi.beginAP(AP_SSID, AP_PASS, 1);
-  if (st != WL_AP_LISTENING) { WiFi.end(); WiFi.beginAP(AP_SSID, AP_PASS, 1); }
-  server.begin();
-  Serial.print("AP: "); Serial.println(AP_SSID);
-  Serial.print("IP: "); Serial.println(WiFi.localIP()); // usualmente 192.168.4.1
-  Serial.println("Calentando MQ-6 (30–60 s)...");
-  delay(60000);
-  Serial.println("Listo.");
+  conectarWiFi();
+
+  timeClient.begin();
+  timeClient.update();
 }
 
+/* =========================
+   LOOP
+   ========================= */
 void loop() {
-  // HTTP
-  WiFiClient client = server.available();
-  if (client) { client.setTimeout(2000); handleClient(client); client.stop(); }
 
-  // Servo siempre quieto cuando no hay acción
-  servoStop();
+  leerControlCompuerta();
+  leerConfigGas();
 
-  if (paused) return;
+  int gas = analogRead(GAS_PIN);
+  Serial.println(gas);
 
-  // Automatización por gas: cerrar 90°, esperar 5 s, abrir 90° para “probar”.
-  bool hayGas = leerGasConfirmado();
-  unsigned long now = millis();
-
-  switch (estado) {
-    case ABIERTO:
-      if (hayGas && !compuertaCerrada) {
-        cerrar_CCW_90();                      // CCW 90° máx.
-        estado = CERRADO_HOLD;
-        tEstadoDesde = now;
-      }
-      break;
-
-    case CERRADO_HOLD:
-      if (now - tEstadoDesde >= HOLD_CERRADO_MS) {
-        abrir_CW_90();                        // CW 90° máx.
-        estado = PROBANDO_ABIERTO;
-        tProbeDesde = now;
-        tEstadoDesde = now;
-      }
-      break;
-
-    case PROBANDO_ABIERTO: {
-      const unsigned long PROBE_WINDOW_MS = 1500;
-      if (now - tProbeDesde <= PROBE_WINDOW_MS) {
-        if (hayGas) {
-          cerrar_CCW_90();                    // vuelve a cerrar si persiste gas
-          estado = CERRADO_HOLD;
-          tEstadoDesde = now;
-        }
-      } else {
-        if (!hayGas) {
-          estado = ABIERTO;                   // quedó abierto y quieto
-          tEstadoDesde = now;
-        } else {
-          // seguridad: si justo hay gas al final de la ventana, cerramos
-          cerrar_CCW_90();
-          estado = CERRADO_HOLD;
-          tEstadoDesde = now;
-        }
-      }
-    } break;
+  if (gas < 5) {
+    delay(3000);
+    return;
   }
+
+  enviarLecturaFirebase(gas);
+
+  /* ===== AUTOMÁTICO ===== */
+  if (modo == "automatico") {
+
+    if (gas >= rangoMax && estado != "cerrado") {
+      moverCerrar();
+    }
+
+    if (gas <= rangoMin && estado != "abierto") {
+      moverAbrir();
+    }
+  }
+
+  /* ===== EVENTOS CRÍTICOS ===== */
+  if (millis() - lastEvent > 15000) {
+
+    if (gas >= eventoMax) {
+      registrarEventoCritico(gas, "Gas muy alto");
+      lastEvent = millis();
+    }
+
+    if (gas <= eventoMin) {
+      registrarEventoCritico(gas, "Gas muy bajo");
+      lastEvent = millis();
+    }
+  }
+
+  delay(3000);
+}
+
+/* =========================
+   WIFI
+   ========================= */
+void conectarWiFi() {
+  while (WiFi.begin(ssid, password) != WL_CONNECTED) {
+    delay(1000);
+  }
+}
+
+/* =========================
+   CONTROL COMPUERTA
+   ========================= */
+void leerControlCompuerta() {
+
+  client.get("/control_compuerta.json?auth=" + String(firebaseAuth));
+  if (client.responseStatusCode() != 200) return;
+
+  String body = client.responseBody();
+
+  if (body.indexOf("\"manual\"") > 0) modo = "manual";
+  if (body.indexOf("\"automatico\"") > 0) modo = "automatico";
+
+  rangoMin = getIntField(body, "rango_min", rangoMin);
+  rangoMax = getIntField(body, "rango_max", rangoMax);
+
+  if (body.indexOf("\"abierto\"") > 0) ultimoEstadoDB = "abierto";
+  if (body.indexOf("\"cerrado\"") > 0) ultimoEstadoDB = "cerrado";
+
+  if (modo == "manual" && ultimoEstadoDB != estado) {
+    if (ultimoEstadoDB == "abierto") moverAbrir();
+    if (ultimoEstadoDB == "cerrado") moverCerrar();
+  }
+}
+
+/* =========================
+   CONFIG GAS
+   ========================= */
+void leerConfigGas() {
+
+  client.get("/config_gas.json?auth=" + String(firebaseAuth));
+  if (client.responseStatusCode() != 200) return;
+
+  String body = client.responseBody();
+  eventoMin = getIntField(body, "minimo", eventoMin);
+  eventoMax = getIntField(body, "maximo", eventoMax);
+}
+
+/* =========================
+   HISTORIAL (CONTROLADO)
+   ========================= */
+void enviarLecturaFirebase(int gas) {
+
+  if (millis() - lastSend < INTERVALO_ENVIO) return;
+  lastSend = millis();
+
+  String data =
+    "{"
+    "\"valor\":" + String(gas) + ","
+    "\"fecha\":\"" + obtenerFecha() + "\","
+    "\"hora\":\"" + obtenerHora() + "\","
+    "\"compuerta\":\"" + estado + "\""
+    "}";
+
+  client.post("/historial_lecturas.json?auth=" + String(firebaseAuth),
+              "application/json", data);
+}
+
+/* =========================
+   EVENTOS CRÍTICOS
+   ========================= */
+void registrarEventoCritico(int gas, String descripcion) {
+
+  String id = String(millis());
+  String path = "/eventos_criticos/" + id + ".json?auth=" + String(firebaseAuth);
+
+  String data =
+    "{"
+    "\"descripcion\":\"" + descripcion + "\","
+    "\"valor\":" + String(gas) + ","
+    "\"fecha\":\"" + obtenerFecha() + "\","
+    "\"hora\":\"" + obtenerHora() + "\""
+    "}";
+
+  client.put(path, "application/json", data);
+}
+
+/* =========================
+   MOVIMIENTOS SERVO
+   ========================= */
+void moverAbrir() {
+  abrirCompuerta();
+  delay(800);
+  detenerCompuerta();
+  actualizarEstado("abierto");
+}
+
+void moverCerrar() {
+  cerrarCompuerta();
+  delay(800);
+  detenerCompuerta();
+  actualizarEstado("cerrado");
+}
+
+/* =========================
+   ESTADO DB
+   ========================= */
+void actualizarEstado(String nuevoEstado) {
+  estado = nuevoEstado;
+
+  client.put("/control_compuerta/estado.json?auth=" + String(firebaseAuth),
+             "application/json",
+             "\"" + nuevoEstado + "\"");
+}
+
+/* =========================
+   SERVO
+   ========================= */
+void abrirCompuerta()   { compuerta.write(70);  }
+void cerrarCompuerta()  { compuerta.write(110); }
+void detenerCompuerta() { compuerta.write(90);  }
+
+/* =========================
+   FECHA / HORA
+   ========================= */
+String obtenerHora() {
+  timeClient.update();
+  char b[9];
+  sprintf(b, "%02d:%02d:%02d",
+          timeClient.getHours(),
+          timeClient.getMinutes(),
+          timeClient.getSeconds());
+  return String(b);
+}
+
+String obtenerFecha() {
+  timeClient.update();
+  unsigned long epoch = timeClient.getEpochTime();
+  unsigned long days = epoch / 86400;
+
+  int year = 1970;
+  while (days >= 365) {
+    days -= 365;
+    year++;
+  }
+
+  char b[11];
+  sprintf(b, "%04d-01-%02lu", year, days + 1);
+  return String(b);
+}
+
+/* =========================
+   JSON SIMPLE
+   ========================= */
+int getIntField(String body, String key, int def) {
+  int p = body.indexOf(key);
+  if (p < 0) return def;
+  int c = body.indexOf(":", p);
+  int e = body.indexOf(",", c);
+  if (e < 0) e = body.indexOf("}", c);
+  return body.substring(c + 1, e).toInt();
 }
